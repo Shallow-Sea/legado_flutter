@@ -1,0 +1,853 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../core/colors.dart';
+import '../../core/providers.dart';
+import '../../core/services/source_validation_service.dart';
+import '../../src/rust/api.dart' as rust_api;
+
+/// `@visibleForTesting` — 让 widget test 能直接弹出 [`_LiveTestDialog`] 而不必
+/// 走完整 SourcePage → 列表 tap → 校验规则的链路（避免连 FRB 真实调用）。
+/// 仅在 source_validation_live_test_test.dart 用。
+///
+/// BATCH-20 (F-W2B-020)：原 module-level `LiveTestRunner` typedef +
+/// `debugLiveTestRunnerOverride` global mutable 删除；测试通过
+/// `ProviderScope.overrides` 注入 fake [SourceValidationService]，
+/// 不再依赖全局 mutable state。
+@visibleForTesting
+Future<void> showLiveTestDialogForTesting(
+  BuildContext context, {
+  required String dbPath,
+  required String sourceId,
+  required String sourceName,
+}) {
+  return showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => _LiveTestDialog(
+      dbPath: dbPath,
+      sourceId: sourceId,
+      sourceName: sourceName,
+    ),
+  );
+}
+
+class SourcePage extends ConsumerStatefulWidget {
+  const SourcePage({super.key});
+
+  @override
+  ConsumerState<SourcePage> createState() => _SourcePageState();
+}
+
+class _SourcePageState extends ConsumerState<SourcePage> {
+  bool _selectMode = false;
+  final Set<String> _selectedIds = {};
+
+  @override
+  Widget build(BuildContext context) {
+    final sourcesAsync = ref.watch(allSourcesProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: _selectMode ? Text('已选 ${_selectedIds.length} 项') : const Text('书源管理'),
+        leading: _selectMode
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: _exitSelectMode,
+              )
+            : null,
+        actions: _selectMode
+            ? [
+                IconButton(
+                  icon: const Icon(Icons.select_all),
+                  tooltip: '全选',
+                  onPressed: _selectAll,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.deselect),
+                  tooltip: '取消全选',
+                  onPressed: () => setState(() => _selectedIds.clear()),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete),
+                  tooltip: '删除选中',
+                  onPressed: _selectedIds.isEmpty ? null : () => _deleteSelected(context),
+                ),
+              ]
+            : [
+                IconButton(
+                  icon: const Icon(Icons.file_upload_outlined),
+                  tooltip: '导出书源 JSON',
+                  onPressed: () => _showExportDialog(context),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.file_download_outlined),
+                  tooltip: '粘贴 JSON 导入',
+                  onPressed: () => _showImportDialog(context),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.folder_open),
+                  tooltip: '从文件导入',
+                  onPressed: () => _importFromFile(context),
+                ),
+                // 批次 20 (05-19): QR 扫码导入。补充入口，原导入按钮保留。
+                IconButton(
+                  icon: const Icon(Icons.qr_code_scanner),
+                  tooltip: '扫码导入',
+                  onPressed: () => context.push('/qr-scan'),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  onPressed: () => ref.invalidate(allSourcesProvider),
+                ),
+              ],
+      ),
+      body: sourcesAsync.when(
+        data: (sources) => _buildSourceList(context, sources),
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (e, _) => Center(child: Text('加载失败: $e')),
+      ),
+      floatingActionButton: _selectMode
+          ? null
+          : FloatingActionButton(
+              onPressed: () => _showAddSourceDialog(context),
+              child: const Icon(Icons.add),
+            ),
+    );
+  }
+
+  Widget _buildSourceList(BuildContext context, List<Map<String, dynamic>> sources) {
+    if (sources.isEmpty) {
+      return const Center(child: Text('暂无书源，点击右下角添加'));
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(8),
+      itemCount: sources.length,
+      itemBuilder: (context, index) {
+        final source = sources[index];
+        final id = source['id'] is String ? source['id'] as String : '';
+        final validId = id.isNotEmpty;
+
+        final enabled = source['enabled'] == true;
+        final hasRules = source['rule_search'] != null || source['rule_toc'] != null || source['rule_content'] != null;
+        return Card(
+          margin: EdgeInsets.zero,
+          child: ListTile(
+            dense: true,
+            leading: _selectMode
+                ? Checkbox(
+                    value: validId && _selectedIds.contains(id),
+                    onChanged: validId ? (_) => _toggleSelect(id) : null,
+                  )
+                : Icon(
+                    enabled ? Icons.check_circle : Icons.cancel,
+                    color: enabled ? context.al.success : context.al.textSecondary,
+                  ),
+            title: Text(source['name'] ?? '未知书源'),
+            subtitle: Text(hasRules ? '${source['url'] ?? ''} (含规则)' : (source['url'] ?? '')),
+            trailing: _selectMode
+                ? null
+                : Switch(
+                    value: enabled,
+                    onChanged: validId ? (val) => _toggleSource(id, val) : null,
+                  ),
+            onTap: validId ? (_selectMode
+                ? () => _toggleSelect(id)
+                : () => _showSourceActions(context, source)) : null,
+            onLongPress: _selectMode || !validId ? null : () => _enterSelectMode(id),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleSource(String id, bool enabled) async {
+    try {
+      await ref.read(dbInitializedProvider.future);
+      final dbPath = await ref.read(dbPathProvider.future);
+      await rust_api.setSourceEnabled(dbPath: dbPath, id: id, enabled: enabled);
+      ref.invalidate(allSourcesProvider);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('操作失败: $e')),
+        );
+      }
+    }
+  }
+
+  void _showAddSourceDialog(BuildContext context) {
+    final nameCtrl = TextEditingController();
+    final urlCtrl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('添加书源'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: '书源名称')),
+            TextField(controller: urlCtrl, decoration: const InputDecoration(labelText: '书源 URL')),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              final name = nameCtrl.text.trim();
+              final url = urlCtrl.text.trim();
+              if (name.isEmpty || url.isEmpty) return;
+              try {
+                await ref.read(dbInitializedProvider.future);
+                final dbPath = await ref.read(dbPathProvider.future);
+                await rust_api.createSource(dbPath: dbPath, name: name, url: url);
+                ref.invalidate(allSourcesProvider);
+                if (ctx.mounted) Navigator.pop(ctx);
+              } catch (e) {
+                if (ctx.mounted) {
+                  ScaffoldMessenger.of(ctx).showSnackBar(
+                    SnackBar(content: Text('添加失败: $e')),
+                  );
+                }
+              }
+            },
+            child: const Text('添加'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showImportDialog(BuildContext context) {
+    final jsonCtrl = TextEditingController();
+    bool importing = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('导入书源 JSON'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: TextField(
+              controller: jsonCtrl,
+              maxLines: 8,
+              enabled: !importing,
+              decoration: const InputDecoration(
+                hintText: '粘贴书源 JSON 数组 [...]',
+                border: OutlineInputBorder(),
+                alignLabelWithHint: true,
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: importing ? null : () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: importing
+                  ? null
+                  : () async {
+                      final json = jsonCtrl.text.trim();
+                      if (json.isEmpty) return;
+                      setDialogState(() => importing = true);
+                      try {
+                        await ref.read(dbInitializedProvider.future);
+                        final dbPath = await ref.read(dbPathProvider.future);
+                        final count = await rust_api.importSourcesFromJson(
+                          dbPath: dbPath,
+                          json: json,
+                        );
+                        ref.invalidate(allSourcesProvider);
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('成功导入 $count 个书源')),
+                          );
+                        }
+                      } catch (e) {
+                        if (ctx.mounted) {
+                          setDialogState(() => importing = false);
+                        }
+                        if (ctx.mounted) {
+                          ScaffoldMessenger.of(ctx).showSnackBar(
+                            SnackBar(content: Text('导入失败: $e')),
+                          );
+                        }
+                      }
+                    },
+              child: importing
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('导入'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showSourceActions(BuildContext context, Map<String, dynamic> source) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(source['name'] ?? '书源操作'),
+        content: Text(source['url'] ?? ''),
+        actions: [
+          TextButton.icon(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _showValidateDialog(context, source);
+            },
+            icon: const Icon(Icons.checklist, size: 18),
+            label: const Text('校验规则'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              final sid = source['id'];
+              if (sid is String && sid.isNotEmpty) _deleteSource(sid);
+            },
+            child: Text('删除', style: TextStyle(color: context.al.destructive)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showValidateDialog(BuildContext context, Map<String, dynamic> source) async {
+    try {
+      await ref.read(dbInitializedProvider.future);
+      final dbPath = await ref.read(dbPathProvider.future);
+      final resultJson = await rust_api.validateSourceFromDb(
+        dbPath: dbPath,
+        sourceId: source['id'] ?? '',
+      );
+      final List<dynamic> issues = const JsonDecoder().convert(resultJson);
+      if (!mounted) return;
+      // 批次 21 (05-19): 即使静态校验通过 (issues 空)，仍弹 dialog 让用户能进入"实跑测试"。
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('${source['name'] ?? '书源'} 校验结果'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: issues.isEmpty
+                ? const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Text(
+                      '书源规则校验通过，未发现问题。\n如需进一步验证可用「实跑测试」。',
+                      textAlign: TextAlign.center,
+                    ),
+                  )
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: issues.length,
+                    itemBuilder: (_, i) {
+                      final issue = issues[i] as Map<String, dynamic>;
+                      final severity = (issue['severity'] as String?) ?? '';
+                      final Color color = severity == 'error'
+                          ? context.al.destructive
+                          : severity == 'warning'
+                              ? context.al.warning
+                              : Theme.of(context).colorScheme.primary;
+                      final IconData icon = severity == 'error'
+                          ? Icons.error
+                          : severity == 'warning'
+                              ? Icons.warning
+                              : Icons.info;
+                      return ListTile(
+                        leading: Icon(icon, color: color, size: 20),
+                        title: Text((issue['field'] as String?) ?? '',
+                            style: TextStyle(
+                                fontSize: 12, color: context.al.onSurface)),
+                        subtitle: Text((issue['message'] as String?) ?? '',
+                            style: const TextStyle(fontSize: 13)),
+                        dense: true,
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton.icon(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _showLiveTestDialog(context, source);
+              },
+              icon: const Icon(Icons.play_circle_outline, size: 18),
+              label: const Text('实跑测试'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('校验失败: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _showLiveTestDialog(
+      BuildContext context, Map<String, dynamic> source) async {
+    final id = source['id'];
+    if (id is! String || id.isEmpty) return;
+    String? dbPath;
+    try {
+      await ref.read(dbInitializedProvider.future);
+      dbPath = await ref.read(dbPathProvider.future);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('数据库未就绪: $e')),
+        );
+      }
+      return;
+    }
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _LiveTestDialog(
+        dbPath: dbPath!,
+        sourceId: id,
+        sourceName: (source['name'] as String?) ?? '书源',
+      ),
+    );
+  }
+
+  Future<void> _deleteSource(String id) async {
+    try {
+      await ref.read(dbInitializedProvider.future);
+      final dbPath = await ref.read(dbPathProvider.future);
+      await rust_api.deleteSource(dbPath: dbPath, id: id);
+      ref.invalidate(allSourcesProvider);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('书源已删除')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('删除失败: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _showExportDialog(BuildContext context) async {
+    try {
+      await ref.read(dbInitializedProvider.future);
+      final dbPath = await ref.read(dbPathProvider.future);
+      final json = await rust_api.exportAllSources(dbPath: dbPath);
+      await Clipboard.setData(ClipboardData(text: json));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('已复制所有书源 JSON 到剪贴板')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导出失败: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _importFromFile(BuildContext context) async {
+    try {
+      final result = await FilePicker.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+      if (result == null || result.files.isEmpty) return;
+
+      final single = result.files.single;
+      final json = single.path != null
+          ? await File(single.path!).readAsString()
+          : single.bytes != null
+              ? utf8.decode(single.bytes!)
+              : '';
+      if (json.trim().isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('文件内容为空')),
+          );
+        }
+        return;
+      }
+
+      await ref.read(dbInitializedProvider.future);
+      final dbPath = await ref.read(dbPathProvider.future);
+      final count = await rust_api.importSourcesFromJson(
+        dbPath: dbPath,
+        json: json,
+      );
+      ref.invalidate(allSourcesProvider);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('成功导入 $count 个书源')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('文件导入失败: $e')),
+        );
+      }
+    }
+  }
+
+  void _enterSelectMode(String id) {
+    setState(() {
+      _selectMode = true;
+      _selectedIds.add(id);
+    });
+  }
+
+  void _exitSelectMode() {
+    setState(() {
+      _selectMode = false;
+      _selectedIds.clear();
+    });
+  }
+
+  void _toggleSelect(String id) {
+    setState(() {
+      if (_selectedIds.contains(id)) {
+        _selectedIds.remove(id);
+      } else {
+        _selectedIds.add(id);
+      }
+    });
+  }
+
+  void _selectAll() {
+    final sources = ref.read(allSourcesProvider).valueOrNull ?? [];
+    setState(() {
+      for (final s in sources) {
+        final id = s['id'];
+        if (id is String && id.isNotEmpty) _selectedIds.add(id);
+      }
+    });
+  }
+
+  Future<void> _deleteSelected(BuildContext context) async {
+    final count = _selectedIds.length;
+    if (count == 0) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('批量删除书源'),
+        content: Text('确定要删除选中的 $count 个书源吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('删除', style: TextStyle(color: context.al.destructive)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await ref.read(dbInitializedProvider.future);
+      final dbPath = await ref.read(dbPathProvider.future);
+      for (final id in _selectedIds) {
+        await rust_api.deleteSource(dbPath: dbPath, id: id);
+      }
+      _exitSelectMode();
+      ref.invalidate(allSourcesProvider);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已删除 $count 个书源')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('批量删除失败: $e')),
+        );
+      }
+    }
+  }
+}
+
+/// 批次 21 (05-19) — 书源实跑 LiveTest dialog。
+///
+/// 顶部：关键字输入框（默认 "测试"）+ "开始测试" 按钮 / 测试中按钮
+/// 进度区：4 个 ListTile (search / book_info / toc / content) — 测试中
+/// 显示 [CircularProgressIndicator]，完成后切换为 check / error 图标 +
+/// sample / error 文本 + 延迟 ms。
+///
+/// BATCH-20 (F-W2B-020)：通过 [sourceValidationServiceProvider] 注入实现，
+/// 测试用 `ProviderScope.overrides` 替换 fake，生产走真实 FRB 调用。
+class _LiveTestDialog extends ConsumerStatefulWidget {
+  final String dbPath;
+  final String sourceId;
+  final String sourceName;
+  const _LiveTestDialog({
+    required this.dbPath,
+    required this.sourceId,
+    required this.sourceName,
+  });
+
+  @override
+  ConsumerState<_LiveTestDialog> createState() => _LiveTestDialogState();
+}
+
+class _LiveTestDialogState extends ConsumerState<_LiveTestDialog> {
+  late final TextEditingController _keywordCtrl;
+  bool _running = false;
+  String? _error;
+  // 4 个 stage 的最终结果。null = 还没跑 / 还在跑。
+  List<Map<String, dynamic>>? _stages;
+  List<Map<String, dynamic>> _staticIssues = const [];
+
+  // stage 顺序与 Rust 端一致；用于显示固定的 4 个 placeholder ListTile。
+  static const List<String> _stageKeys = [
+    'search',
+    'book_info',
+    'toc',
+    'content',
+  ];
+  static const Map<String, String> _stageLabels = {
+    'search': '搜索',
+    'book_info': '书籍详情',
+    'toc': '章节列表',
+    'content': '章节内容',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _keywordCtrl = TextEditingController(text: '测试');
+  }
+
+  @override
+  void dispose() {
+    _keywordCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runTest() async {
+    final keyword = _keywordCtrl.text.trim();
+    if (keyword.isEmpty) {
+      setState(() => _error = '请输入关键字');
+      return;
+    }
+    setState(() {
+      _running = true;
+      _error = null;
+      _stages = null;
+      _staticIssues = const [];
+    });
+    try {
+      final svc = ref.read(sourceValidationServiceProvider);
+      final json = await svc.validateLive(
+        dbPath: widget.dbPath,
+        sourceId: widget.sourceId,
+        keyword: keyword,
+      );
+      final decoded = const JsonDecoder().convert(json);
+      if (decoded is! Map<String, dynamic>) {
+        throw Exception('返回格式异常: $json');
+      }
+      final stages = (decoded['stages'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList();
+      final issues = (decoded['static_issues'] as List<dynamic>? ?? const [])
+          .whereType<Map<String, dynamic>>()
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _running = false;
+        _stages = stages;
+        _staticIssues = issues;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _running = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  Widget _buildStageTile(String key) {
+    final label = _stageLabels[key] ?? key;
+    if (_running && _stages == null) {
+      return ListTile(
+        dense: true,
+        leading: const SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        title: Text(label),
+        subtitle: const Text('测试中…'),
+      );
+    }
+    if (_stages == null) {
+      return ListTile(
+        dense: true,
+        leading: Icon(Icons.radio_button_unchecked,
+            color: context.al.textSecondary, size: 20),
+        title: Text(label),
+        subtitle: const Text('待开始'),
+      );
+    }
+    final found = _stages!.firstWhere(
+      (s) => s['stage'] == key,
+      orElse: () => const <String, dynamic>{},
+    );
+    if (found.isEmpty) {
+      return ListTile(
+        dense: true,
+        leading:
+            Icon(Icons.help_outline, color: context.al.textSecondary, size: 20),
+        title: Text(label),
+        subtitle: const Text('未返回结果'),
+      );
+    }
+    final ok = found['ok'] == true;
+    final latency = found['latency_ms'];
+    final sample = found['sample'] as String?;
+    final error = found['error'] as String?;
+    return ListTile(
+      dense: true,
+      leading: Icon(
+        ok ? Icons.check_circle : Icons.error,
+        color: ok ? context.al.success : context.al.destructive,
+        size: 20,
+      ),
+      title: Text(label),
+      subtitle: Text(
+        ok ? (sample ?? '成功') : (error ?? '失败'),
+        maxLines: 4,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: latency is num ? Text('${latency}ms') : null,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('${widget.sourceName} · 实跑测试'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _keywordCtrl,
+                    enabled: !_running,
+                    decoration: const InputDecoration(
+                      labelText: '关键字',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: _running ? null : _runTest,
+                  child: _running
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child:
+                              CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('开始测试'),
+                ),
+              ],
+            ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(
+                  _error!,
+                  style: TextStyle(color: context.al.destructive),
+                ),
+              ),
+            const SizedBox(height: 8),
+            const Divider(height: 1),
+            for (final key in _stageKeys) _buildStageTile(key),
+            if (_stages != null && _staticIssues.isNotEmpty) ...[
+              const Divider(height: 1),
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 8),
+                child: Text(
+                  '静态校验问题 (${_staticIssues.length})',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+              for (final issue in _staticIssues)
+                ListTile(
+                  dense: true,
+                  leading: Icon(
+                    issue['severity'] == 'error'
+                        ? Icons.error
+                        : issue['severity'] == 'warning'
+                            ? Icons.warning
+                            : Icons.info,
+                    size: 18,
+                    color: issue['severity'] == 'error'
+                        ? context.al.destructive
+                        : issue['severity'] == 'warning'
+                            ? context.al.warning
+                            : Theme.of(context).colorScheme.primary,
+                  ),
+                  title: Text(
+                    (issue['field'] as String?) ?? '',
+                    style: TextStyle(
+                        fontSize: 11, color: context.al.onSurface),
+                  ),
+                  subtitle: Text((issue['message'] as String?) ?? '',
+                      style: const TextStyle(fontSize: 12)),
+                ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _running ? null : () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
+}
